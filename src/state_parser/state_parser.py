@@ -1,4 +1,19 @@
-"""Base classes and protocols for the state parser."""
+"""Protocol-driven building blocks for stateful parsing of semi-structured text.
+
+This module defines a small framework for orchestrating parser selection and
+execution over an ordered stream of indexed strings.
+
+Core flow:
+1. An ``IndexedStringProviderProtocol`` yields input items.
+2. ``StateParser`` asks a ``ParseStrategyProtocol`` which parsers are expected
+    for the current state.
+3. Parsers are tried in order until one returns a non-``NoMatchResult``.
+4. Terminal parse failures raise immediately; unmatched input raises
+    ``NoMatchingParser``.
+
+The intent is to keep orchestration generic while letting task-specific parser
+implementations and strategies encode domain rules.
+"""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -8,14 +23,18 @@ type ParseContext = dict[str, Any]
 
 
 class StateParserError(Exception):
-    """An exception class for state parser errors."""
+    """Base exception for all state parser orchestration errors."""
 
     def __init__(self, *args: Any):
         super().__init__(*args)
 
 
 class ParserStopError(StateParserError):
-    """An exception class for parse failures that should stop the parse process."""
+    """Raised when a parser reports a terminal failure.
+
+    Wraps a ``ParseFailureStop`` result so callers can inspect failure context
+    and the original error message.
+    """
 
     def __init__(self, parse_failure: ParseFailureStop):
         self.parse_failure = parse_failure
@@ -23,7 +42,11 @@ class ParserStopError(StateParserError):
 
 
 class NoMatchingParser(StateParserError):
-    """An exception class for no matching parser."""
+    """Raised when no expected parser can handle an input item.
+
+    This is raised by ``StateParser`` after exhausting all parsers returned by
+    ``ParseStrategyProtocol.expected`` for the current input.
+    """
 
     def __init__(self, parse_result: NoMatchResult):
         self.parse_result = parse_result
@@ -32,10 +55,11 @@ class NoMatchingParser(StateParserError):
 
 @dataclass
 class IndexedStringBase:
-    """A base class for an indexed string, which consists of an index and a string.
+    """Input unit passed through the parser pipeline.
 
-    The index can be of any type, as it is not specified in the base class. Specific
-    implementations can extend this class to specify the type of the index as needed.
+    Attributes:
+        index: Source position identifier (line number, offset, token id, etc.).
+        string: Raw text to parse at that position.
     """
 
     index: Any
@@ -44,16 +68,21 @@ class IndexedStringBase:
 
 @dataclass
 class IndexedStringInt(IndexedStringBase):
-    """A class for an indexed string, which consists of an index and a string."""
+    """``IndexedStringBase`` specialization with an integer index.
+
+    Useful when the input position is naturally represented as a line number or
+    character offset.
+    """
 
     index: int
 
 
 @dataclass
 class ParseResultBase:
-    """A base class for a parse result, which consists of an index and a value.
+    """Base type for all parser return results.
 
-    Specific parsers can extend this class to include additional fields as needed.
+    Parsers should return concrete subclasses to communicate how orchestration
+    should proceed.
     """
 
     indexed_string: IndexedStringBase
@@ -61,10 +90,14 @@ class ParseResultBase:
 
 @dataclass
 class ParseFailureStop(ParseResultBase):
-    """A class for a parse failure, which consists of an index and a value.
+    """Result indicating an unrecoverable parse failure.
 
-    Signals that a parse attempt has failed, and the parse process should stop.
-    Includes an error message for debugging purposes.
+    Returning this from a parser causes ``StateParser`` to raise
+    ``ParserStopError`` immediately.
+
+    Attributes:
+        context: Parse context at the time of failure.
+        error_message: Human-readable failure detail.
     """
 
     context: ParseContext
@@ -73,50 +106,99 @@ class ParseFailureStop(ParseResultBase):
 
 @dataclass
 class NoMatchResult(ParseResultBase):
-    """A class for a parse result that did not match a parser.
+    """Result indicating the current parser does not apply to the input.
 
-    Used by a parser to signal that it did not match the input, and that the next
-    expected parser should be tried.
-
-    Also used by the state parser to signal that no expected parser matched the input,
-    and that a NoMatchingParser error should be raised.
+    ``StateParser`` treats this as a non-terminal miss and tries the next parser
+    in the expected parser tuple. If all expected parsers return ``NoMatchResult``,
+    ``StateParser`` raises ``NoMatchingParser``.
     """
 
     pass
 
 
 class ParserProtocol(Protocol):
+    """Contract for a parser that attempts to parse one indexed string.
+
+    Implementations can mutate and return context to carry state across inputs.
+    """
+
     def parse(
         self, indexed_string: IndexedStringBase, ctx: ParseContext
-    ) -> tuple[ParseResultBase, ParseContext]: ...
+    ) -> tuple[ParseResultBase, ParseContext]:
+        """Parse a single indexed string.
+
+        Args:
+            indexed_string: Current input item.
+            ctx: Current parse context.
+
+        Returns:
+            A tuple of ``(parse_result, updated_context)``.
+
+            Recommended result semantics:
+            - Return ``NoMatchResult`` when this parser should be skipped.
+            - Return ``ParseFailureStop`` for unrecoverable parse failures.
+            - Return a task-specific ``ParseResultBase`` subclass on success.
+        """
+        ...
 
 
 class ParseStrategyProtocol(Protocol):
-    """A protocol for a parse strategy.
+    """Contract for selecting which parsers to try next.
 
-    The expected method should return a tuple of parsers that are expected to be used
-    next, based on the parse history and the current context.
+    Strategy implementations encode state-machine rules by choosing parser order
+    from recent parse history and current context.
     """
 
     def expected(
         self, parse_history: list[ParseResultBase], ctx: ParseContext
     ) -> tuple[ParserProtocol, ...]:
-        """Returns a tuple of parsers that are expected to be used next."""
+        """Return parsers to try, in priority order, for the next input item.
+
+        Args:
+            parse_history: Most recent parse results, clipped to the configured
+                ``StateParser.parser_lookback`` window.
+            ctx: Current parse context.
+
+        Returns:
+            A tuple of parser instances ordered from most to least likely.
+        """
         ...
 
 
 class IndexedStringProviderProtocol(Protocol):
-    """A protocol for an indexed string provider."""
+    """Contract for providing ordered input to ``StateParser``."""
 
-    def indexed_string(self) -> Iterable[IndexedStringBase]: ...
+    def indexed_string(self) -> Iterable[IndexedStringBase]:
+        """Yield indexed strings in the order they should be parsed."""
+        ...
 
 
 class StateParser:
+    """Orchestrates parser selection and execution for indexed text input.
+
+    ``StateParser`` does not implement domain parsing itself. Instead, it:
+    - obtains candidate parsers from ``ParseStrategyProtocol``,
+    - tries them in order,
+    - records successful parse results,
+    - and raises explicit exceptions for terminal failure or no match.
+    """
+
     def __init__(
         self,
         parse_strategy: ParseStrategyProtocol,
         parser_lookback: int = 5,
     ):
+        """Initialize a state parser.
+
+        Args:
+            parse_strategy: Strategy used to select candidate parsers.
+            parser_lookback: Number of most recent parse results provided to
+                ``parse_strategy.expected``. Use ``0`` to disable history.
+
+        Raises:
+            TypeError: If ``parser_lookback`` is not an ``int``.
+            ValueError: If ``parser_lookback`` is negative.
+        """
         if type(parser_lookback) is not int:
             raise TypeError("parser_lookback must be an integer.")
         if parser_lookback < 0:
@@ -130,14 +212,27 @@ class StateParser:
         indexed_string_provider: IndexedStringProviderProtocol,
         ctx: ParseContext,
     ) -> list[ParseResultBase]:
-        """Runs the state parser on the provided input.
+        """Run parsing over all input from the provider.
 
         Args:
-            indexed_string_provider: An object that provides an iterable of indexed strings.
-            ctx: A dictionary representing the current parse context.
+            indexed_string_provider: Source of ordered ``IndexedStringBase``
+                items to parse.
+            ctx: Initial parse context. Parsers may mutate and replace it.
 
         Returns:
-            A list of parse results.
+            Parse results produced by successful parser matches in this run.
+
+        Raises:
+            ParserStopError: If a parser returns ``ParseFailureStop``.
+            NoMatchingParser: If no expected parser matches an input item.
+
+        Notes:
+            Parser trial behavior per input item:
+            1. Query strategy for expected parsers.
+            2. Try each parser in order.
+            3. On ``NoMatchResult``, continue to the next parser.
+            4. On first non-``NoMatchResult`` success, record result and move to
+               the next input item.
         """
         results: list[ParseResultBase] = []
         for indexed_string in indexed_string_provider.indexed_string():
